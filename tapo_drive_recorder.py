@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """tapo_drive_recorder.py — Continuous Tapo C202 Live Stream + Google Drive Upload
 
 Flow:
@@ -18,14 +19,23 @@ Google Drive auth (recommended for VPS/headless): Service Account
 import base64
 import json
 import os
+import re
 import socket
 import ssl
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import requests
 import urllib3
+
+# Vietnam timezone (UTC+7)
+VN_TZ = timezone(timedelta(hours=7))
+
+
+def vn_now() -> datetime:
+    """Get current time in Vietnam timezone."""
+    return datetime.now(VN_TZ)
 
 urllib3.disable_warnings()
 
@@ -214,6 +224,134 @@ def _get_active_account() -> dict | None:
     return None
 
 
+def _find_oldest_date_folder(service, parent_folder_id: str) -> tuple[str, str, str] | None:
+    """Find the oldest date-named subfolder (YYYY-MM-DD) in a Drive folder.
+    Returns (folder_id, folder_name, parent_id) or None."""
+    try:
+        q = (
+            "mimeType='application/vnd.google-apps.folder' "
+            "and trashed=false "
+            f"and '{parent_folder_id}' in parents"
+        )
+        res = service.files().list(
+            q=q, spaces="drive",
+            fields="files(id,name)",
+            orderBy="name",  # YYYY-MM-DD sorts chronologically
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        folders = res.get("files", [])
+
+        # Filter only date-formatted folders (YYYY-MM-DD)
+        date_folders = [f for f in folders if re.match(r"^\d{4}-\d{2}-\d{2}$", f["name"])]
+
+        if date_folders:
+            oldest = date_folders[0]  # Already sorted by name (date)
+            return oldest["id"], oldest["name"], parent_folder_id
+    except Exception as e:
+        print(f"[CLEANUP] Error listing folders: {e}")
+    return None
+
+
+def _delete_folder_contents(service, folder_id: str, folder_name: str) -> int:
+    """Delete all files in a folder, then the folder itself. Returns bytes freed."""
+    freed = 0
+    try:
+        # List all files in the folder
+        q = f"'{folder_id}' in parents and trashed=false"
+        res = service.files().list(
+            q=q, spaces="drive",
+            fields="files(id,name,size)",
+            pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = res.get("files", [])
+
+        for f in files:
+            try:
+                size = int(f.get("size", 0))
+                service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+                freed += size
+                print(f"[CLEANUP] Deleted {folder_name}/{f['name']} ({_format_bytes(size)})")
+            except Exception as e:
+                print(f"[CLEANUP] Failed to delete {f['name']}: {e}")
+
+        # Delete the folder itself
+        service.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
+        print(f"[CLEANUP] Removed folder {folder_name}")
+
+        # Clear folder cache
+        keys_to_remove = [k for k in _DRIVE_FOLDER_CACHE if _DRIVE_FOLDER_CACHE[k] == folder_id]
+        for k in keys_to_remove:
+            del _DRIVE_FOLDER_CACHE[k]
+
+    except Exception as e:
+        print(f"[CLEANUP] Error deleting folder {folder_name}: {e}")
+
+    return freed
+
+
+def _free_space_by_deleting_oldest() -> bool:
+    """Delete the oldest date folder across all accounts to free space.
+    Returns True if space was freed successfully."""
+    global _account_list
+
+    if not _account_list:
+        return False
+
+    print("\n[CLEANUP] All accounts full — looking for oldest recordings to delete...")
+
+    # Find the globally oldest date folder across all accounts
+    oldest_info = None  # (date_name, account_idx, folder_id, service)
+
+    for idx, account in enumerate(_account_list):
+        try:
+            folder_id = account.get("folder_id", GOOGLE_DRIVE_FOLDER_ID)
+            if not folder_id:
+                continue
+            service = _build_drive_service_from_token(account["token_file"])
+            result = _find_oldest_date_folder(service, folder_id)
+            if result:
+                fid, fname, pid = result
+                if oldest_info is None or fname < oldest_info[0]:
+                    oldest_info = (fname, idx, fid, service)
+        except Exception as e:
+            print(f"[CLEANUP] Error checking {account['name']}: {e}")
+
+    if oldest_info is None:
+        print("[CLEANUP] No date folders found to delete!")
+        return False
+
+    date_name, acct_idx, folder_id, service = oldest_info
+    account = _account_list[acct_idx]
+    print(f"[CLEANUP] Deleting oldest day: {date_name} from {account['name']}...")
+
+    freed = _delete_folder_contents(service, folder_id, date_name)
+    print(f"[CLEANUP] Freed {_format_bytes(freed)} from {account['name']}")
+
+    # Also delete same date from other accounts (same day, different uploaders)
+    for idx, other_account in enumerate(_account_list):
+        if idx == acct_idx:
+            continue
+        try:
+            other_folder_id = other_account.get("folder_id", GOOGLE_DRIVE_FOLDER_ID)
+            if not other_folder_id:
+                continue
+            other_service = _build_drive_service_from_token(other_account["token_file"])
+            result = _find_oldest_date_folder(other_service, other_folder_id)
+            if result and result[1] == date_name:
+                extra_freed = _delete_folder_contents(other_service, result[0], date_name)
+                freed += extra_freed
+                print(f"[CLEANUP] Also freed {_format_bytes(extra_freed)} from {other_account['name']}")
+        except Exception as e:
+            pass
+
+    print(f"[CLEANUP] Total freed: {_format_bytes(freed)}")
+    return freed > 0
+
+
 def _build_drive_service():
     """Build Drive service — multi-account aware."""
     try:
@@ -227,6 +365,21 @@ def _build_drive_service():
     account = _get_active_account()
     if account:
         return account["service"], account.get("folder_id", GOOGLE_DRIVE_FOLDER_ID)
+
+    # All accounts full — try to free space by deleting oldest day
+    if _account_list:
+        MAX_CLEANUP_ATTEMPTS = 3
+        for attempt in range(1, MAX_CLEANUP_ATTEMPTS + 1):
+            print(f"[CLEANUP] Attempt {attempt}/{MAX_CLEANUP_ATTEMPTS}...")
+            if _free_space_by_deleting_oldest():
+                # Re-check after cleanup
+                account = _get_active_account()
+                if account:
+                    print("[CLEANUP] Space freed successfully, resuming upload")
+                    return account["service"], account.get("folder_id", GOOGLE_DRIVE_FOLDER_ID)
+            else:
+                break
+        print("[CLEANUP] Could not free enough space after cleanup attempts")
 
     # Fallback: Service Account
     if os.path.exists(GOOGLE_DRIVE_SA_FILE):
@@ -294,7 +447,7 @@ def upload_to_gdrive(filepath: str) -> bool:
     if len(path_parts) >= 2:
         date_folder_name = path_parts[-2]
     else:
-        date_folder_name = datetime.now().strftime("%Y-%m-%d")
+        date_folder_name = vn_now().strftime("%Y-%m-%d")
 
     date_folder_id = _get_or_create_folder(service, date_folder_name, folder_id)
 
@@ -504,7 +657,7 @@ def connect_and_stream():
     tls.settimeout(5)
 
     chunk_start = time.time()
-    now = datetime.now()
+    now = vn_now()
     date_folder = now.strftime("%Y-%m-%d")
     file_name = now.strftime("%Y-%m-%d_%H-%M-%S.ts")
 
@@ -533,7 +686,7 @@ def connect_and_stream():
                 threading.Thread(target=process_video_chunk, args=(ts_path,), daemon=True).start()
 
                 chunk_start = time.time()
-                now = datetime.now()
+                now = vn_now()
                 date_folder = now.strftime("%Y-%m-%d")
                 file_name = now.strftime("%Y-%m-%d_%H-%M-%S.ts")
 
