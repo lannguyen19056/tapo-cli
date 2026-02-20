@@ -3,3 +3,7 @@ requests
 urllib3
 datetime
 pycryptodome
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
