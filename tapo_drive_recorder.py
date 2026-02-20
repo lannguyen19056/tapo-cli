@@ -52,10 +52,25 @@ GOOGLE_DRIVE_SA_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdrive_service_account.json"),
 ).strip()
 
-# OAuth2 token file (preferred over Service Account for personal Drive)
-GOOGLE_DRIVE_OAUTH_TOKEN = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "gdrive_oauth_token.json"
-)
+# ─── Multi-Account OAuth2 Support ────────────────────────────────────────────
+# Place multiple token files:
+#   gdrive_oauth_token.json        (account 1 — 15 GB)
+#   gdrive_oauth_token_2.json      (account 2 — 15 GB)
+#   gdrive_oauth_token_3.json      (account 3 — 15 GB)
+#   ...
+# Each account gets its own folder_id mapping in gdrive_accounts.json (optional).
+# If no accounts config, all accounts use GOOGLE_DRIVE_FOLDER_ID env var.
+#
+# Setup extra accounts:
+#   python3 oauth_exchange.py              # follow prompts, save as gdrive_oauth_token_2.json
+#   Then share your Drive folder with each Google account.
+
+SCRIPT_DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+
+GOOGLE_DRIVE_ACCOUNTS_FILE = os.path.join(SCRIPT_DIR_PATH, "gdrive_accounts.json")
+
+# Storage threshold: switch account when free space < this (bytes)
+STORAGE_MIN_FREE_BYTES = int(os.environ.get("STORAGE_MIN_FREE_MB", "500")) * 1024 * 1024  # default 500 MB
 
 # Multipart boundaries
 CLIENT_BOUNDARY = "--client-stream-boundary--"
@@ -68,7 +83,139 @@ DEVICE_BOUNDARY = "--device-stream-boundary--"
 _DRIVE_FOLDER_CACHE: dict[tuple[str, str], str] = {}
 
 
+def _discover_oauth_tokens() -> list[dict]:
+    """Find all gdrive_oauth_token*.json files and load their config."""
+    import glob
+
+    pattern = os.path.join(SCRIPT_DIR_PATH, "gdrive_oauth_token*.json")
+    token_files = sorted(glob.glob(pattern))
+
+    if not token_files:
+        return []
+
+    # Load optional accounts config (maps token file → folder_id)
+    accounts_config = {}
+    if os.path.exists(GOOGLE_DRIVE_ACCOUNTS_FILE):
+        with open(GOOGLE_DRIVE_ACCOUNTS_FILE) as f:
+            accounts_config = json.load(f)
+
+    accounts = []
+    for tf in token_files:
+        name = os.path.basename(tf)
+        folder_id = accounts_config.get(name, {}).get("folder_id", GOOGLE_DRIVE_FOLDER_ID)
+        accounts.append({
+            "token_file": tf,
+            "name": name,
+            "folder_id": folder_id,
+        })
+
+    return accounts
+
+
+def _build_drive_service_from_token(token_file: str):
+    """Build a Drive API service from a specific OAuth2 token file."""
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials as UserCredentials
+
+    with open(token_file) as f:
+        token_data = json.load(f)
+
+    creds = UserCredentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=token_data.get("client_id"),
+        client_secret=token_data.get("client_secret"),
+        scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
+    )
+
+    # Refresh if expired
+    if creds.expired or not creds.token:
+        from google.auth.transport.requests import Request
+        creds.refresh(Request())
+        token_data["token"] = creds.token
+        with open(token_file, "w") as f:
+            json.dump(token_data, f, indent=2)
+
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _get_storage_info(service) -> tuple[int, int, int]:
+    """Returns (total_bytes, used_bytes, free_bytes) for a Drive account."""
+    try:
+        about = service.about().get(fields="storageQuota").execute()
+        quota = about.get("storageQuota", {})
+        total = int(quota.get("limit", 0))
+        used = int(quota.get("usage", 0))
+        free = total - used if total > 0 else float("inf")
+        return total, used, free
+    except Exception as e:
+        print(f"[GDRIVE] Warning: could not get storage info: {e}")
+        return 0, 0, float("inf")
+
+
+def _format_bytes(b) -> str:
+    if b == float("inf"):
+        return "unlimited"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(b) < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+# Track which account index to use (round-robin on quota full)
+_current_account_idx = 0
+_account_list: list[dict] | None = None
+
+
+def _get_active_account() -> dict | None:
+    """Get the current active account with enough free space."""
+    global _current_account_idx, _account_list
+
+    if _account_list is None:
+        _account_list = _discover_oauth_tokens()
+        if _account_list:
+            names = ", ".join(a["name"] for a in _account_list)
+            total_gb = len(_account_list) * 15
+            print(f"[GDRIVE] Found {len(_account_list)} account(s): {names}")
+            print(f"[GDRIVE] Total potential storage: ~{total_gb} GB")
+
+    if not _account_list:
+        return None
+
+    # Try each account starting from current index
+    tried = 0
+    while tried < len(_account_list):
+        idx = _current_account_idx % len(_account_list)
+        account = _account_list[idx]
+
+        try:
+            service = _build_drive_service_from_token(account["token_file"])
+            total, used, free = _get_storage_info(service)
+
+            if free > STORAGE_MIN_FREE_BYTES:
+                print(f"[GDRIVE] Using {account['name']} "
+                      f"(used: {_format_bytes(used)}/{_format_bytes(total)}, "
+                      f"free: {_format_bytes(free)})")
+                return {**account, "service": service}
+
+            print(f"[GDRIVE] {account['name']} nearly full "
+                  f"(free: {_format_bytes(free)}), trying next...")
+            _current_account_idx += 1
+            tried += 1
+
+        except Exception as e:
+            print(f"[GDRIVE] {account['name']} error: {e}, trying next...")
+            _current_account_idx += 1
+            tried += 1
+
+    print("[GDRIVE] ALL accounts are full or unavailable!")
+    return None
+
+
 def _build_drive_service():
+    """Build Drive service — multi-account aware."""
     try:
         from googleapiclient.discovery import build
     except ImportError as e:
@@ -76,33 +223,10 @@ def _build_drive_service():
             "Missing Google Drive dependencies. Install: pip install -r requirements.txt"
         ) from e
 
-    # Prefer OAuth2 token (personal account, has storage quota)
-    if os.path.exists(GOOGLE_DRIVE_OAUTH_TOKEN):
-        from google.oauth2.credentials import Credentials as UserCredentials
-
-        with open(GOOGLE_DRIVE_OAUTH_TOKEN) as f:
-            token_data = json.load(f)
-
-        creds = UserCredentials(
-            token=token_data.get("token"),
-            refresh_token=token_data.get("refresh_token"),
-            token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=token_data.get("client_id"),
-            client_secret=token_data.get("client_secret"),
-            scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
-        )
-
-        # Refresh if expired
-        if creds.expired or not creds.token:
-            from google.auth.transport.requests import Request
-            creds.refresh(Request())
-            # Save refreshed token
-            token_data["token"] = creds.token
-            with open(GOOGLE_DRIVE_OAUTH_TOKEN, "w") as f:
-                json.dump(token_data, f, indent=2)
-
-        print("[GDRIVE] Using OAuth2 user credentials")
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    # Try multi-account OAuth2 first
+    account = _get_active_account()
+    if account:
+        return account["service"], account.get("folder_id", GOOGLE_DRIVE_FOLDER_ID)
 
     # Fallback: Service Account
     if os.path.exists(GOOGLE_DRIVE_SA_FILE):
@@ -111,7 +235,7 @@ def _build_drive_service():
         scopes = ["https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(GOOGLE_DRIVE_SA_FILE, scopes=scopes)
         print("[GDRIVE] Using Service Account credentials")
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+        return build("drive", "v3", credentials=creds, cache_discovery=False), GOOGLE_DRIVE_FOLDER_ID
 
     raise RuntimeError(
         "No Google Drive credentials found.\n"
@@ -154,13 +278,17 @@ def _get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
 
 
 def upload_to_gdrive(filepath: str) -> bool:
-    """Uploads a file to Google Drive under a date subfolder."""
-    if not GOOGLE_DRIVE_FOLDER_ID:
+    """Uploads a file to Google Drive under a date subfolder. Multi-account aware."""
+    if not GOOGLE_DRIVE_FOLDER_ID and not os.path.exists(GOOGLE_DRIVE_ACCOUNTS_FILE):
         print("[GDRIVE] Skipping upload: GOOGLE_DRIVE_FOLDER_ID not set.")
         return False
 
-    # Build a per-upload client: httplib2 is not guaranteed thread-safe.
-    service = _build_drive_service()
+    # Build a per-upload client (multi-account: picks account with free space)
+    service, folder_id = _build_drive_service()
+
+    if not folder_id:
+        print("[GDRIVE] Skipping upload: no folder_id for active account.")
+        return False
 
     path_parts = filepath.split(os.sep)
     if len(path_parts) >= 2:
@@ -168,7 +296,7 @@ def upload_to_gdrive(filepath: str) -> bool:
     else:
         date_folder_name = datetime.now().strftime("%Y-%m-%d")
 
-    date_folder_id = _get_or_create_folder(service, date_folder_name, GOOGLE_DRIVE_FOLDER_ID)
+    date_folder_id = _get_or_create_folder(service, date_folder_name, folder_id)
 
     try:
         from googleapiclient.http import MediaFileUpload
