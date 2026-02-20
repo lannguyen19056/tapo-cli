@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+
+# Secrets — NEVER commit these
+gdrive_service_account.json
+gdrive_oauth_client.json
+gdrive_oauth_token.json
+client_secret.json
+tapo_config.json
+
+# Build / extracted artifacts
+extracted_xapk/
+tools/
+TP-Link_Tapo_3.17.109.xapk
+
+# Stream recordings (large binary files)
+stream_output/
+
+# Misc
+wget-log
+*.log
+ffprobe_output.txt
+pes_output.txt
+pid_output.txt
+pmt_output.txt

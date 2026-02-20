@@ -52,6 +52,11 @@ GOOGLE_DRIVE_SA_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdrive_service_account.json"),
 ).strip()
 
+# OAuth2 token file (preferred over Service Account for personal Drive)
+GOOGLE_DRIVE_OAUTH_TOKEN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gdrive_oauth_token.json"
+)
+
 # Multipart boundaries
 CLIENT_BOUNDARY = "--client-stream-boundary--"
 FRAME_BOUNDARY = "----client-stream-boundary--"
@@ -65,22 +70,54 @@ _DRIVE_FOLDER_CACHE: dict[tuple[str, str], str] = {}
 
 def _build_drive_service():
     try:
-        from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
     except ImportError as e:
         raise RuntimeError(
             "Missing Google Drive dependencies. Install: pip install -r requirements.txt"
         ) from e
 
-    if not os.path.exists(GOOGLE_DRIVE_SA_FILE):
-        raise RuntimeError(
-            f"Google Drive service account JSON not found: {GOOGLE_DRIVE_SA_FILE}\n"
-            "Create/download a service account key JSON and set GOOGLE_DRIVE_SA_FILE or place it next to this script."
+    # Prefer OAuth2 token (personal account, has storage quota)
+    if os.path.exists(GOOGLE_DRIVE_OAUTH_TOKEN):
+        from google.oauth2.credentials import Credentials as UserCredentials
+
+        with open(GOOGLE_DRIVE_OAUTH_TOKEN) as f:
+            token_data = json.load(f)
+
+        creds = UserCredentials(
+            token=token_data.get("token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=token_data.get("client_id"),
+            client_secret=token_data.get("client_secret"),
+            scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
         )
 
-    scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file(GOOGLE_DRIVE_SA_FILE, scopes=scopes)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+        # Refresh if expired
+        if creds.expired or not creds.token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            # Save refreshed token
+            token_data["token"] = creds.token
+            with open(GOOGLE_DRIVE_OAUTH_TOKEN, "w") as f:
+                json.dump(token_data, f, indent=2)
+
+        print("[GDRIVE] Using OAuth2 user credentials")
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # Fallback: Service Account
+    if os.path.exists(GOOGLE_DRIVE_SA_FILE):
+        from google.oauth2.service_account import Credentials
+
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_file(GOOGLE_DRIVE_SA_FILE, scopes=scopes)
+        print("[GDRIVE] Using Service Account credentials")
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    raise RuntimeError(
+        "No Google Drive credentials found.\n"
+        "Run: python3 setup_gdrive_oauth.py  (for personal account)\n"
+        "Or place gdrive_service_account.json (for service account/Shared Drive)"
+    )
 
 
 def _escape_drive_query_value(value: str) -> str:
@@ -98,7 +135,7 @@ def _get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
         f"and name='{_escape_drive_query_value(folder_name)}' "
         f"and '{parent_id}' in parents"
     )
-    res = service.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
+    res = service.files().list(q=q, spaces="drive", fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     files = res.get("files", [])
     if files:
         folder_id = files[0]["id"]
@@ -110,7 +147,7 @@ def _get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id],
     }
-    created = service.files().create(body=metadata, fields="id").execute()
+    created = service.files().create(body=metadata, fields="id", supportsAllDrives=True).execute()
     folder_id = created["id"]
     _DRIVE_FOLDER_CACHE[key] = folder_id
     return folder_id
@@ -147,7 +184,7 @@ def upload_to_gdrive(filepath: str) -> bool:
     media = MediaFileUpload(filepath, mimetype="video/MP2T", resumable=True)
     created = (
         service.files()
-        .create(body=metadata, media_body=media, fields="id, webViewLink")
+        .create(body=metadata, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
         .execute()
     )
     print(f"[GDRIVE] Upload successful: id={created.get('id')} link={created.get('webViewLink')}")
