@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 urllib3.disable_warnings()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-CONFIG_PATH = os.path.expanduser("~/.tapo-cli/.config")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tapo_config.json")
 config      = json.loads(open(CONFIG_PATH).read())
 TOKEN       = config["token"]
 
